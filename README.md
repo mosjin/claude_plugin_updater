@@ -9,35 +9,43 @@ Cross-platform Python CLI to simplify Claude plugin management.
 
 No external dependencies — stdlib only.
 
-## Usage
+## Commands
+
+### list
+
+Show all installed plugins in a compact table.
 
 ```bash
-# List all installed plugins (clean table)
 python plugin_manager.py list
-
-# Update one plugin (partial name OK)
-python plugin_manager.py update caveman
-
-# Update multiple plugins
-python plugin_manager.py update caveman ecc eduforge
-
-# Update all plugins (sequential)
-python plugin_manager.py update --all
-
-# Update all plugins (parallel, faster)
-python plugin_manager.py update --all --parallel
 ```
-
-## Example output
 
 ```
 Plugin                     Source                    Version        Scope    Status
 ───────────────────────────────────────────────────────────────────────────────────
 caveman                    caveman                   655b7d9c5431   user     ✔
 ecc                        ecc                       2.0.0-rc.1     user     ✔
+context7                   claude-plugins-official   cda114029ef8   user     ✗
 ...
 
 27 plugins installed
+```
+
+### update
+
+Update one, multiple, or all plugins. Partial plugin names are accepted (no need to type `caveman@caveman`).
+
+```bash
+# Single plugin
+python plugin_manager.py update caveman
+
+# Multiple plugins
+python plugin_manager.py update caveman ecc eduforge
+
+# All plugins (sequential)
+python plugin_manager.py update --all
+
+# All plugins (parallel — faster for many plugins)
+python plugin_manager.py update --all --parallel
 ```
 
 ```
@@ -51,12 +59,40 @@ Updating 3 plugins...
 Updated: 2  Already current: 1  Failed: 0
 ```
 
+Icons: `✔` updated · `─` already current · `✗` failed
+
+### uninstall / remove
+
+Remove one or more plugins. Prompts for confirmation unless `-y` is passed.
+
+```bash
+# Single plugin (with confirmation prompt)
+python plugin_manager.py uninstall caveman
+
+# Skip prompt
+python plugin_manager.py uninstall caveman -y
+
+# Multiple plugins
+python plugin_manager.py uninstall caveman ecc -y
+
+# Preserve plugin data directory
+python plugin_manager.py uninstall caveman -y --keep-data
+
+# Remove unused auto-installed dependencies
+python plugin_manager.py uninstall caveman -y --prune
+
+# 'remove' is an alias
+python plugin_manager.py remove caveman -y
+```
+
 ## Tests
 
 ```bash
 python -m pytest tests/ -v
 ```
 
+36 tests, all subprocess calls mocked — no real plugins are modified during testing.
+
 ## Cross-platform
 
-Works on Windows, Linux, macOS. Uses `shutil.which` to locate the `claude` executable.
+Works on Windows, Linux, macOS. Uses `shutil.which` to locate `claude`/`claude.cmd`/`claude.exe`.
