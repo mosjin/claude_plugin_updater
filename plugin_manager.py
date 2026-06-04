@@ -10,6 +10,7 @@ Usage:
 
 import argparse
 import json
+import re
 import shutil
 import subprocess
 import sys
@@ -39,7 +40,10 @@ def list_plugins() -> list:
     code, out, err = run_claude(["plugin", "list", "--json"])
     if code != 0:
         sys.exit(f"Error listing plugins: {err.strip()}")
-    return json.loads(out)
+    plugins = json.loads(out)
+    if not isinstance(plugins, list):
+        sys.exit(f"Error: unexpected response from claude (expected list, got {type(plugins).__name__})")
+    return plugins
 
 
 def resolve_plugins(names: list, all_plugins: list) -> list:
@@ -73,22 +77,29 @@ def update_one(plugin: dict) -> dict:
     message = (out + err).strip()
     if code != 0:
         return {"id": pid, "status": "failed", "message": message}
-    already = any(kw in message.lower() for kw in ("already", "up to date", "up-to-date"))
+    already = bool(re.search(r"\b(already|up[\s-]to[\s-]date)\b", message, re.IGNORECASE))
     return {"id": pid, "status": "current" if already else "updated", "message": message}
 
 
+def _split_id(plugin_id: str) -> tuple:
+    parts = plugin_id.split("@", 1)
+    if len(parts) != 2:
+        sys.exit(f"Error: malformed plugin id '{plugin_id}' (expected 'name@source')")
+    return parts[0], parts[1]
+
+
 def _print_table(plugins: list) -> None:
-    name_w = max(len(p["id"].split("@")[0]) for p in plugins) + 2
-    src_w = max(len(p["id"].split("@", 1)[1]) for p in plugins) + 2
-    ver_w = max(len(p["version"]) for p in plugins) + 2
+    name_w = max(len(_split_id(p["id"])[0]) for p in plugins) + 2
+    src_w = max(len(_split_id(p["id"])[1]) for p in plugins) + 2
+    ver_w = max(len(p.get("version", "")) for p in plugins) + 2
 
     header = f"{'Plugin':<{name_w}} {'Source':<{src_w}} {'Version':<{ver_w}} {'Scope':<8} Status"
     print(header)
     print("─" * len(header))
     for p in plugins:
-        name, source = p["id"].split("@", 1)
-        status = "✔" if p["enabled"] else "✗"
-        print(f"{name:<{name_w}} {source:<{src_w}} {p['version']:<{ver_w}} {p['scope']:<8} {status}")
+        name, source = _split_id(p["id"])
+        status = "✔" if p.get("enabled", True) else "✗"
+        print(f"{name:<{name_w}} {source:<{src_w}} {p.get('version', '?'):<{ver_w}} {p.get('scope', '?'):<8} {status}")
     print(f"\n{len(plugins)} plugin{'s' if len(plugins) != 1 else ''} installed")
 
 
@@ -118,7 +129,11 @@ def cmd_update(args) -> None:
         with ThreadPoolExecutor(max_workers=min(8, total)) as ex:
             futures = {ex.submit(update_one, p): p for p in targets}
             for fut in as_completed(futures):
-                r = fut.result()
+                plugin = futures[fut]
+                try:
+                    r = fut.result()
+                except Exception as exc:
+                    r = {"id": plugin["id"], "status": "failed", "message": str(exc)}
                 done[order[r["id"]]] = r
                 print(f"  {icons[r['status']]} {r['id']}")
         results = done
