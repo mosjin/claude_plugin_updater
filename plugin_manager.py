@@ -158,10 +158,62 @@ def cmd_update(args) -> None:
         sys.exit(1)
 
 
+def uninstall_one(plugin: dict, keep_data: bool = False, prune: bool = False) -> dict:
+    """Uninstall a single plugin. Returns result dict with status key."""
+    pid = plugin["id"]
+    cli_args = ["plugin", "uninstall", pid]
+    if keep_data:
+        cli_args.append("--keep-data")
+    if prune:
+        cli_args += ["--prune", "-y"]
+    code, out, err = run_claude(cli_args)
+    message = (out + err).strip()
+    if code != 0:
+        return {"id": pid, "status": "failed", "message": message}
+    return {"id": pid, "status": "uninstalled", "message": message}
+
+
+def cmd_uninstall(args) -> None:
+    if not args.plugins:
+        sys.exit("Error: specify plugin name(s) to uninstall")
+
+    all_plugins = list_plugins()
+    targets = resolve_plugins(args.plugins, all_plugins)
+    total = len(targets)
+
+    if not args.yes:
+        names = ", ".join(p["id"] for p in targets)
+        print(f"About to uninstall {total} plugin{'s' if total != 1 else ''}: {names}")
+        answer = input("Proceed? [y/N] ").strip().lower()
+        if answer != "y":
+            print("Aborted.")
+            return
+
+    print(f"Uninstalling {total} plugin{'s' if total != 1 else ''}...\n")
+    results = []
+    for i, p in enumerate(targets, 1):
+        print(f"[{i}/{total}] {p['id']}...", end=" ", flush=True)
+        r = uninstall_one(p, keep_data=args.keep_data, prune=args.prune)
+        print("✔" if r["status"] == "uninstalled" else "✗")
+        results.append(r)
+
+    failed = [r for r in results if r["status"] == "failed"]
+    succeeded = total - len(failed)
+
+    print(f"\n{'─' * 40}")
+    print(f"Uninstalled: {succeeded}  Failed: {len(failed)}")
+
+    if failed:
+        print("\nFailed plugins:")
+        for r in failed:
+            print(f"  ✗ {r['id']}: {r['message']}")
+        sys.exit(1)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         prog="plugin_manager",
-        description="Claude plugin manager — list and update plugins",
+        description="Claude plugin manager — list, update, and uninstall plugins",
     )
     sub = parser.add_subparsers(dest="command", required=True)
 
@@ -172,11 +224,19 @@ def main() -> None:
     up.add_argument("--all", action="store_true", help="Update all installed plugins")
     up.add_argument("--parallel", action="store_true", help="Run updates concurrently (useful with --all)")
 
+    un = sub.add_parser("uninstall", aliases=["remove"], help="Uninstall plugin(s)")
+    un.add_argument("plugins", nargs="*", metavar="plugin", help="Plugin name(s) to uninstall")
+    un.add_argument("-y", "--yes", action="store_true", help="Skip confirmation prompt")
+    un.add_argument("--keep-data", action="store_true", help="Preserve plugin data directory")
+    un.add_argument("--prune", action="store_true", help="Remove unused auto-installed dependencies")
+
     args = parser.parse_args()
     if args.command == "list":
         cmd_list(args)
     elif args.command == "update":
         cmd_update(args)
+    elif args.command in ("uninstall", "remove"):
+        cmd_uninstall(args)
 
 
 if __name__ == "__main__":

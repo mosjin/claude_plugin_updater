@@ -216,5 +216,123 @@ class TestRunClaude(unittest.TestCase):
                 plugin_manager.run_claude(["plugin", "list", "--json"])
 
 
+class TestUninstallOne(unittest.TestCase):
+    def test_successful_uninstall(self):
+        with patch("plugin_manager.run_claude", return_value=(0, "Plugin uninstalled successfully", "")):
+            result = plugin_manager.uninstall_one(SAMPLE_PLUGINS[0])
+        self.assertEqual(result["status"], "uninstalled")
+        self.assertEqual(result["id"], "caveman@caveman")
+
+    def test_failed_uninstall(self):
+        with patch("plugin_manager.run_claude", return_value=(1, "", "Plugin not found")):
+            result = plugin_manager.uninstall_one(SAMPLE_PLUGINS[0])
+        self.assertEqual(result["status"], "failed")
+        self.assertIn("not found", result["message"])
+
+    def test_calls_with_full_id(self):
+        with patch("plugin_manager.run_claude", return_value=(0, "ok", "")) as mock:
+            plugin_manager.uninstall_one(SAMPLE_PLUGINS[0])
+        args = mock.call_args[0][0]
+        self.assertEqual(args[:2], ["plugin", "uninstall"])
+        self.assertIn("caveman@caveman", args)
+
+    def test_keep_data_flag(self):
+        with patch("plugin_manager.run_claude", return_value=(0, "ok", "")) as mock:
+            plugin_manager.uninstall_one(SAMPLE_PLUGINS[0], keep_data=True)
+        args = mock.call_args[0][0]
+        self.assertIn("--keep-data", args)
+
+    def test_prune_adds_yes(self):
+        """--prune must include -y because subprocess is non-TTY."""
+        with patch("plugin_manager.run_claude", return_value=(0, "ok", "")) as mock:
+            plugin_manager.uninstall_one(SAMPLE_PLUGINS[0], prune=True)
+        args = mock.call_args[0][0]
+        self.assertIn("--prune", args)
+        self.assertIn("-y", args)
+
+    def test_no_extra_flags_by_default(self):
+        with patch("plugin_manager.run_claude", return_value=(0, "ok", "")) as mock:
+            plugin_manager.uninstall_one(SAMPLE_PLUGINS[0])
+        args = mock.call_args[0][0]
+        self.assertNotIn("--keep-data", args)
+        self.assertNotIn("--prune", args)
+        self.assertNotIn("-y", args)
+
+
+class TestCmdUninstall(unittest.TestCase):
+    def _make_args(self, plugins=None, yes=False, keep_data=False, prune=False):
+        class Args:
+            pass
+        a = Args()
+        a.plugins = plugins or []
+        a.yes = yes
+        a.keep_data = keep_data
+        a.prune = prune
+        return a
+
+    def test_uninstall_single_with_yes(self):
+        with patch("plugin_manager.list_plugins", return_value=SAMPLE_PLUGINS):
+            with patch("plugin_manager.uninstall_one", return_value={"id": "caveman@caveman", "status": "uninstalled", "message": "ok"}) as mock:
+                with patch("sys.stdout", new_callable=StringIO):
+                    plugin_manager.cmd_uninstall(self._make_args(plugins=["caveman"], yes=True))
+        mock.assert_called_once()
+        self.assertEqual(mock.call_args[0][0]["id"], "caveman@caveman")
+
+    def test_uninstall_prompts_without_yes(self):
+        with patch("plugin_manager.list_plugins", return_value=SAMPLE_PLUGINS):
+            with patch("plugin_manager.uninstall_one") as mock_uninstall:
+                with patch("builtins.input", return_value="n"):
+                    with patch("sys.stdout", new_callable=StringIO):
+                        plugin_manager.cmd_uninstall(self._make_args(plugins=["caveman"], yes=False))
+        mock_uninstall.assert_not_called()
+
+    def test_uninstall_proceeds_on_yes_input(self):
+        with patch("plugin_manager.list_plugins", return_value=SAMPLE_PLUGINS):
+            with patch("plugin_manager.uninstall_one", return_value={"id": "caveman@caveman", "status": "uninstalled", "message": "ok"}) as mock:
+                with patch("builtins.input", return_value="y"):
+                    with patch("sys.stdout", new_callable=StringIO):
+                        plugin_manager.cmd_uninstall(self._make_args(plugins=["caveman"], yes=False))
+        mock.assert_called_once()
+
+    def test_uninstall_multiple(self):
+        with patch("plugin_manager.list_plugins", return_value=SAMPLE_PLUGINS):
+            with patch("plugin_manager.uninstall_one", return_value={"id": "x", "status": "uninstalled", "message": "ok"}) as mock:
+                with patch("sys.stdout", new_callable=StringIO):
+                    plugin_manager.cmd_uninstall(self._make_args(plugins=["caveman", "ecc"], yes=True))
+        self.assertEqual(mock.call_count, 2)
+
+    def test_failure_exits_nonzero(self):
+        def side_effect(plugin, **kw):
+            return {"id": plugin["id"], "status": "failed", "message": "error"}
+
+        with patch("plugin_manager.list_plugins", return_value=SAMPLE_PLUGINS):
+            with patch("plugin_manager.uninstall_one", side_effect=side_effect):
+                with patch("sys.stdout", new_callable=StringIO):
+                    with self.assertRaises(SystemExit) as ctx:
+                        plugin_manager.cmd_uninstall(self._make_args(plugins=["caveman"], yes=True))
+        self.assertEqual(ctx.exception.code, 1)
+
+    def test_passes_keep_data_flag(self):
+        with patch("plugin_manager.list_plugins", return_value=SAMPLE_PLUGINS):
+            with patch("plugin_manager.uninstall_one", return_value={"id": "caveman@caveman", "status": "uninstalled", "message": "ok"}) as mock:
+                with patch("sys.stdout", new_callable=StringIO):
+                    plugin_manager.cmd_uninstall(self._make_args(plugins=["caveman"], yes=True, keep_data=True))
+        _, kwargs = mock.call_args
+        self.assertTrue(kwargs.get("keep_data"))
+
+    def test_passes_prune_flag(self):
+        with patch("plugin_manager.list_plugins", return_value=SAMPLE_PLUGINS):
+            with patch("plugin_manager.uninstall_one", return_value={"id": "caveman@caveman", "status": "uninstalled", "message": "ok"}) as mock:
+                with patch("sys.stdout", new_callable=StringIO):
+                    plugin_manager.cmd_uninstall(self._make_args(plugins=["caveman"], yes=True, prune=True))
+        _, kwargs = mock.call_args
+        self.assertTrue(kwargs.get("prune"))
+
+    def test_no_plugins_exits(self):
+        with patch("plugin_manager.list_plugins", return_value=SAMPLE_PLUGINS):
+            with self.assertRaises(SystemExit):
+                plugin_manager.cmd_uninstall(self._make_args(plugins=[], yes=True))
+
+
 if __name__ == "__main__":
     unittest.main()
