@@ -9,6 +9,24 @@ Cross-platform Python CLI to simplify Claude plugin management.
 
 No external dependencies — stdlib only.
 
+## bootstrap_tools.py
+
+Separate script, separate concern: installs the standalone CLI binaries
+(`rtk`, `gh-asset`, plus the `node`/`uv` runtimes several hooks and MCP
+servers need) that `~/.claude`'s hooks and CLAUDE.md rules assume are on
+PATH. These are not Claude plugins — `plugin_manager.py` above only ever
+talks to `claude plugin ...`. No sudo required; everything installs under
+`~/.local`.
+
+```bash
+python bootstrap_tools.py          # install what's missing
+python bootstrap_tools.py --check  # report status only, install nothing
+```
+
+Written after migrating dev from Windows to Ubuntu (2026-09-03) surfaced
+that none of these were present on a fresh machine. `sqz` is a known gap —
+see the script's `KNOWN_UNAVAILABLE` note for why.
+
 ## Commands
 
 ### list
