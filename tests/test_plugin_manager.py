@@ -246,6 +246,26 @@ class TestCmdUpdate(unittest.TestCase):
         self.assertNotIn("Plugin updated successfully", output)
         self.assertIn("no longer listed", output)
 
+    def test_results_line_shows_before_after_version(self):
+        """The complaint this fixes: per-item 'done' during the run says
+        nothing about whether a version actually changed. The results
+        block must spell out before → after so it's unambiguous."""
+        after = [dict(SAMPLE_PLUGINS[0], version="new-version"), SAMPLE_PLUGINS[1], SAMPLE_PLUGINS[2]]
+        with patch("plugin_manager.list_plugins", side_effect=[SAMPLE_PLUGINS, after]):
+            with patch("plugin_manager.update_one", return_value={"id": "caveman@caveman", "code": 0, "message": "ok"}):
+                with patch("sys.stdout", new_callable=StringIO) as mock_out:
+                    plugin_manager.cmd_update(self._make_args(plugins=["caveman"]))
+                    output = mock_out.getvalue()
+        self.assertIn("655b7d9c5431 → new-version", output)
+
+    def test_results_line_shows_unchanged_version_when_current(self):
+        with patch("plugin_manager.list_plugins", side_effect=[SAMPLE_PLUGINS, SAMPLE_PLUGINS]):
+            with patch("plugin_manager.update_one", return_value={"id": "caveman@caveman", "code": 0, "message": "already current"}):
+                with patch("sys.stdout", new_callable=StringIO) as mock_out:
+                    plugin_manager.cmd_update(self._make_args(plugins=["caveman"]))
+                    output = mock_out.getvalue()
+        self.assertIn("655b7d9c5431 (unchanged)", output)
+
     def test_no_restart_note_when_nothing_updated(self):
         with patch("plugin_manager.list_plugins", side_effect=[SAMPLE_PLUGINS, SAMPLE_PLUGINS]):
             with patch("plugin_manager.update_one", return_value={"id": "caveman@caveman", "code": 0, "message": "already current"}):

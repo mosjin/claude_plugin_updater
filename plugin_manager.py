@@ -168,11 +168,24 @@ def cmd_update(args) -> None:
         # the update's own success text next to a ✗ — keep the failure
         # reason honest instead of echoing a message that contradicts it.
         message = r["message"] if not (r["code"] == 0 and after_version is None) else "plugin no longer listed after update"
-        results.append({"id": pid, "status": status, "message": message})
+        results.append({
+            "id": pid,
+            "status": status,
+            "message": message,
+            "before_version": before_versions[pid],
+            "after_version": after_version,
+        })
 
     print(f"\n{'─' * 40}")
+    print("Results (version before → after):")
     for r in results:
-        print(f"  {icons[r['status']]} {r['id']}")
+        if r["status"] == "updated":
+            detail = f"{r['before_version']} → {r['after_version']}"
+        elif r["status"] == "current":
+            detail = f"{r['after_version']} (unchanged)"
+        else:
+            detail = r["message"]
+        print(f"  {icons[r['status']]} {r['id']}  {detail}")
 
     updated = sum(1 for r in results if r["status"] == "updated")
     current = sum(1 for r in results if r["status"] == "current")
