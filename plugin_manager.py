@@ -10,7 +10,6 @@ Usage:
 
 import argparse
 import json
-import re
 import shutil
 import subprocess
 import sys
@@ -71,14 +70,26 @@ def resolve_plugins(names: list, all_plugins: list) -> list:
 
 
 def update_one(plugin: dict) -> dict:
-    """Update a single plugin. Returns result dict with status key."""
+    """Run `claude plugin update <id>`. Returns the raw outcome only —
+    status (updated/current/failed) is resolved by the caller from a
+    before/after version diff, not by guessing at stdout wording.
+    """
     pid = plugin["id"]
     code, out, err = run_claude(["plugin", "update", pid])
-    message = (out + err).strip()
+    return {"id": pid, "code": code, "message": (out + err).strip()}
+
+
+def resolve_update_status(before_version, after_version, code: int) -> str:
+    """Classify one update's outcome from real evidence: exit code plus
+    whether the plugin's version string actually changed. A zero exit code
+    with unchanged stdout wording used to be misread as success by regex —
+    this compares state instead of parsing prose.
+    """
     if code != 0:
-        return {"id": pid, "status": "failed", "message": message}
-    already = bool(re.search(r"\b(already|up[\s-]to[\s-]date)\b", message, re.IGNORECASE))
-    return {"id": pid, "status": "current" if already else "updated", "message": message}
+        return "failed"
+    if after_version is None:
+        return "failed"
+    return "updated" if after_version != before_version else "current"
 
 
 def _split_id(plugin_id: str) -> tuple:
@@ -120,36 +131,61 @@ def cmd_update(args) -> None:
     total = len(targets)
     print(f"Updating {total} plugin{'s' if total != 1 else ''}...\n")
 
-    results = []
-    icons = {"updated": "✔", "current": "─", "failed": "✗"}
+    before_versions = {p["id"]: p.get("version") for p in targets}
+    raw_by_id = {}
 
     if args.parallel and total > 1:
-        order = {p["id"]: i for i, p in enumerate(targets)}
-        done = [None] * total
         with ThreadPoolExecutor(max_workers=min(8, total)) as ex:
-            futures = {ex.submit(update_one, p): p for p in targets}
+            futures = {ex.submit(update_one, p): p["id"] for p in targets}
             for fut in as_completed(futures):
-                plugin = futures[fut]
+                pid = futures[fut]
                 try:
                     r = fut.result()
                 except Exception as exc:
-                    r = {"id": plugin["id"], "status": "failed", "message": str(exc)}
-                done[order[r["id"]]] = r
-                print(f"  {icons[r['status']]} {r['id']}")
-        results = done
+                    r = {"id": pid, "code": 1, "message": str(exc)}
+                raw_by_id[pid] = r
+                print(f"  ran {pid}")
     else:
         for i, p in enumerate(targets, 1):
             print(f"[{i}/{total}] {p['id']}...", end=" ", flush=True)
             r = update_one(p)
-            print(icons[r["status"]])
-            results.append(r)
+            raw_by_id[p["id"]] = r
+            print("done" if r["code"] == 0 else "error")
+
+    # Re-list once, after every update has run, to get real post-update
+    # versions — cheaper than one `claude plugin list` per plugin and gives
+    # every status the same consistent snapshot to compare against.
+    after_versions = {p["id"]: p.get("version") for p in list_plugins()}
+
+    icons = {"updated": "✔", "current": "─", "failed": "✗"}
+    results = []
+    for p in targets:
+        pid = p["id"]
+        r = raw_by_id[pid]
+        after_version = after_versions.get(pid)
+        status = resolve_update_status(before_versions[pid], after_version, r["code"])
+        # A zero exit code paired with "vanished from the list" would print
+        # the update's own success text next to a ✗ — keep the failure
+        # reason honest instead of echoing a message that contradicts it.
+        message = r["message"] if not (r["code"] == 0 and after_version is None) else "plugin no longer listed after update"
+        results.append({"id": pid, "status": status, "message": message})
+
+    print(f"\n{'─' * 40}")
+    for r in results:
+        print(f"  {icons[r['status']]} {r['id']}")
 
     updated = sum(1 for r in results if r["status"] == "updated")
     current = sum(1 for r in results if r["status"] == "current")
     failed = [r for r in results if r["status"] == "failed"]
 
-    print(f"\n{'─' * 40}")
-    print(f"Updated: {updated}  Already current: {current}  Failed: {len(failed)}")
+    print(f"\nUpdated: {updated}  Already current: {current}  Failed: {len(failed)}")
+
+    if updated:
+        print(
+            "\nNote: restart Claude Code to load the updated plugin(s) — "
+            "any MCP servers or skills they bundle keep running the old "
+            "version in this session until then."
+        )
 
     if failed:
         print("\nFailed plugins:")
@@ -210,6 +246,67 @@ def cmd_uninstall(args) -> None:
         sys.exit(1)
 
 
+def parse_mcp_list(output: str) -> list:
+    """Parse `claude mcp list` text into records.
+
+    Line shape is "<name>: <command> - <status>". Plugin-bundled server
+    names look like "plugin:<plugin>:<server>" (colon-separated, no space),
+    so splitting on the first ": " (colon + space) safely separates the
+    name from the command even though the name itself contains colons.
+    """
+    records = []
+    for line in output.splitlines():
+        line = line.strip()
+        if ": " not in line or " - " not in line:
+            continue
+        name, rest = line.split(": ", 1)
+        command, _, status = rest.rpartition(" - ")
+        records.append({"name": name.strip(), "command": command.strip(), "status": status.strip()})
+    return records
+
+
+def classify_mcp_server(name: str) -> str:
+    """Which update path (if any) owns this MCP server.
+
+    - "plugin": bundled inside a plugin — `update` above already covers it.
+    - "host": a claude.ai-managed connector — Anthropic operates it, not us.
+    - "standalone": registered directly via `claude mcp add` — nothing in
+      the `claude` CLI updates these; the underlying package (npm/uv/pip)
+      must be updated by hand.
+    """
+    if name.startswith("plugin:"):
+        return "plugin"
+    if name.startswith("claude.ai "):
+        return "host"
+    return "standalone"
+
+
+def cmd_doctor(_args) -> None:
+    """Surface the one class of MCP server this tool cannot update: those
+    registered standalone via `claude mcp add` rather than bundled in a
+    plugin. `claude mcp` has no update subcommand, so these can only be
+    refreshed through their own package manager — this just makes them
+    visible instead of silently unmanaged.
+    """
+    code, out, err = run_claude(["mcp", "list"])
+    if code != 0:
+        sys.exit(f"Error running 'claude mcp list': {err.strip()}")
+
+    standalone = [r for r in parse_mcp_list(out) if classify_mcp_server(r["name"]) == "standalone"]
+
+    print("Standalone MCP servers (not bundled in any plugin):\n")
+    if not standalone:
+        print("  none — every configured MCP server is either a claude.ai")
+        print("  host connector or bundled inside a plugin (covered by `update`).")
+        return
+
+    for r in standalone:
+        print(f"  {r['name']}: {r['command']}  [{r['status']}]")
+    print(f"\n{len(standalone)} standalone server{'s' if len(standalone) != 1 else ''} found.")
+    print("`claude mcp` has no update subcommand — refresh these via their own")
+    print("package manager (npm/uv/pip), not this tool.")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         prog="plugin_manager",
@@ -230,6 +327,11 @@ def main() -> None:
     un.add_argument("--keep-data", action="store_true", help="Preserve plugin data directory")
     un.add_argument("--prune", action="store_true", help="Remove unused auto-installed dependencies")
 
+    sub.add_parser(
+        "doctor",
+        help="List standalone MCP servers this tool cannot update (not bundled in any plugin)",
+    )
+
     args = parser.parse_args()
     if args.command == "list":
         cmd_list(args)
@@ -237,6 +339,8 @@ def main() -> None:
         cmd_update(args)
     elif args.command in ("uninstall", "remove"):
         cmd_uninstall(args)
+    elif args.command == "doctor":
+        cmd_doctor(args)
 
 
 if __name__ == "__main__":

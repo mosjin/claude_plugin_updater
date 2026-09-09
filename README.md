@@ -79,6 +79,38 @@ Updated: 2  Already current: 1  Failed: 0
 
 Icons: `✔` updated · `─` already current · `✗` failed
 
+Status is resolved by comparing the plugin's version string before and
+after (via a second `claude plugin list --json` once all updates finish),
+not by guessing at the CLI's stdout wording — a `0` exit code with an
+unchanged version string now correctly reads as "current" instead of
+"updated". This detects a changed version string, not arbitrary content
+changes — a marketplace reinstalling identical content under the same
+version still reads as "current". If anything did update, a note reminds
+you to restart Claude Code: an updated plugin's bundled MCP servers/skills
+keep running the old code in the current session until then.
+
+### doctor
+
+Some MCP servers aren't bundled inside any plugin — they were registered
+directly with `claude mcp add`. `claude mcp` has no `update` subcommand, so
+`plugin_manager.py update` cannot touch them; they must be refreshed through
+their own package manager (npm/uv/pip). `doctor` lists exactly those, so
+they don't go silently unmanaged.
+
+```bash
+python plugin_manager.py doctor
+```
+
+```
+Standalone MCP servers (not bundled in any plugin):
+
+  firecrawl: npx -y firecrawl-mcp  [✔ Connected]
+
+1 standalone server found.
+`claude mcp` has no update subcommand — refresh these via their own
+package manager (npm/uv/pip), not this tool.
+```
+
 ### uninstall / remove
 
 Remove one or more plugins. Prompts for confirmation unless `-y` is passed.

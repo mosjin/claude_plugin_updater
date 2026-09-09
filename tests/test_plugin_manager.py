@@ -80,32 +80,56 @@ class TestResolvePlugins(unittest.TestCase):
 
 
 class TestUpdateOne(unittest.TestCase):
-    def test_successful_update(self):
+    """update_one is now a thin subprocess wrapper — it no longer guesses
+    status from stdout wording. That's resolve_update_status's job, tested
+    below against real before/after version state.
+    """
+
+    def test_returns_raw_code_and_message(self):
         with patch("plugin_manager.run_claude", return_value=(0, "Plugin updated successfully", "")):
             result = plugin_manager.update_one(SAMPLE_PLUGINS[0])
-        self.assertEqual(result["status"], "updated")
         self.assertEqual(result["id"], "caveman@caveman")
+        self.assertEqual(result["code"], 0)
+        self.assertIn("updated successfully", result["message"])
 
-    def test_already_current(self):
-        with patch("plugin_manager.run_claude", return_value=(0, "Plugin is already up to date", "")):
-            result = plugin_manager.update_one(SAMPLE_PLUGINS[0])
-        self.assertEqual(result["status"], "current")
-
-    def test_already_current_variant(self):
-        with patch("plugin_manager.run_claude", return_value=(0, "already at latest version", "")):
-            result = plugin_manager.update_one(SAMPLE_PLUGINS[0])
-        self.assertEqual(result["status"], "current")
-
-    def test_failed_update(self):
+    def test_nonzero_code_preserved(self):
         with patch("plugin_manager.run_claude", return_value=(1, "", "Failed to update: network error")):
             result = plugin_manager.update_one(SAMPLE_PLUGINS[0])
-        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["code"], 1)
         self.assertIn("network error", result["message"])
 
     def test_calls_with_full_id(self):
         with patch("plugin_manager.run_claude", return_value=(0, "updated", "")) as mock:
             plugin_manager.update_one(SAMPLE_PLUGINS[0])
         mock.assert_called_once_with(["plugin", "update", "caveman@caveman"])
+
+
+class TestResolveUpdateStatus(unittest.TestCase):
+    """The version-diff replacement for the old regex-on-stdout guess."""
+
+    def test_version_changed_is_updated(self):
+        status = plugin_manager.resolve_update_status("1.0.0", "1.1.0", code=0)
+        self.assertEqual(status, "updated")
+
+    def test_version_unchanged_is_current(self):
+        status = plugin_manager.resolve_update_status("1.0.0", "1.0.0", code=0)
+        self.assertEqual(status, "current")
+
+    def test_nonzero_exit_is_failed_even_if_version_changed(self):
+        status = plugin_manager.resolve_update_status("1.0.0", "1.1.0", code=1)
+        self.assertEqual(status, "failed")
+
+    def test_missing_after_version_is_failed(self):
+        """Plugin vanished from the post-update list (e.g. it got removed) —
+        cannot claim success without evidence the new version exists."""
+        status = plugin_manager.resolve_update_status("1.0.0", None, code=0)
+        self.assertEqual(status, "failed")
+
+    def test_success_message_but_unchanged_version_is_not_updated(self):
+        """The bug this replaces: a zero exit code alone used to be read
+        as success regardless of whether anything actually changed."""
+        status = plugin_manager.resolve_update_status("655b7d9c5431", "655b7d9c5431", code=0)
+        self.assertEqual(status, "current")
 
 
 class TestCmdList(unittest.TestCase):
@@ -134,6 +158,12 @@ class TestCmdList(unittest.TestCase):
 
 
 class TestCmdUpdate(unittest.TestCase):
+    """cmd_update now calls list_plugins twice: once to resolve targets
+    (before-state), once after all updates run (after-state), and derives
+    status from the diff via resolve_update_status. Mocks below supply both
+    snapshots with side_effect=[before, after].
+    """
+
     def _make_args(self, plugins=None, all_=False, parallel=False):
         class Args:
             pass
@@ -144,16 +174,17 @@ class TestCmdUpdate(unittest.TestCase):
         return a
 
     def test_update_single_by_partial_name(self):
-        with patch("plugin_manager.list_plugins", return_value=SAMPLE_PLUGINS):
-            with patch("plugin_manager.update_one", return_value={"id": "caveman@caveman", "status": "updated", "message": "ok"}) as mock_update:
+        after = [dict(SAMPLE_PLUGINS[0], version="new-version"), SAMPLE_PLUGINS[1], SAMPLE_PLUGINS[2]]
+        with patch("plugin_manager.list_plugins", side_effect=[SAMPLE_PLUGINS, after]):
+            with patch("plugin_manager.update_one", return_value={"id": "caveman@caveman", "code": 0, "message": "ok"}) as mock_update:
                 with patch("sys.stdout", new_callable=StringIO):
                     plugin_manager.cmd_update(self._make_args(plugins=["caveman"]))
         mock_update.assert_called_once()
         self.assertEqual(mock_update.call_args[0][0]["id"], "caveman@caveman")
 
     def test_update_all(self):
-        with patch("plugin_manager.list_plugins", return_value=SAMPLE_PLUGINS):
-            with patch("plugin_manager.update_one", return_value={"id": "x", "status": "updated", "message": "ok"}) as mock_update:
+        with patch("plugin_manager.list_plugins", side_effect=[SAMPLE_PLUGINS, SAMPLE_PLUGINS]):
+            with patch("plugin_manager.update_one", return_value={"id": "x", "code": 0, "message": "ok"}) as mock_update:
                 with patch("sys.stdout", new_callable=StringIO):
                     plugin_manager.cmd_update(self._make_args(all_=True))
         self.assertEqual(mock_update.call_count, 3)
@@ -162,10 +193,11 @@ class TestCmdUpdate(unittest.TestCase):
         """One failure must not abort remaining updates."""
         def side_effect(plugin):
             if plugin["id"] == "ecc@ecc":
-                return {"id": "ecc@ecc", "status": "failed", "message": "network error"}
-            return {"id": plugin["id"], "status": "updated", "message": "ok"}
+                return {"id": "ecc@ecc", "code": 1, "message": "network error"}
+            return {"id": plugin["id"], "code": 0, "message": "ok"}
 
-        with patch("plugin_manager.list_plugins", return_value=SAMPLE_PLUGINS):
+        after = [dict(SAMPLE_PLUGINS[0], version="new"), SAMPLE_PLUGINS[1], dict(SAMPLE_PLUGINS[2], version="new")]
+        with patch("plugin_manager.list_plugins", side_effect=[SAMPLE_PLUGINS, after]):
             with patch("plugin_manager.update_one", side_effect=side_effect):
                 with patch("sys.stdout", new_callable=StringIO):
                     with self.assertRaises(SystemExit) as ctx:
@@ -173,22 +205,54 @@ class TestCmdUpdate(unittest.TestCase):
         self.assertEqual(ctx.exception.code, 1)
 
     def test_summary_shows_counts(self):
+        """caveman updates (version changes), ecc is already current
+        (version unchanged), context7 fails (nonzero exit)."""
         def side_effect(plugin):
-            if plugin["id"] == "caveman@caveman":
-                return {"id": "caveman@caveman", "status": "updated", "message": "ok"}
-            if plugin["id"] == "ecc@ecc":
-                return {"id": "ecc@ecc", "status": "current", "message": "already up to date"}
-            return {"id": plugin["id"], "status": "failed", "message": "error"}
+            if plugin["id"] == "context7@claude-plugins-official":
+                return {"id": plugin["id"], "code": 1, "message": "error"}
+            return {"id": plugin["id"], "code": 0, "message": "ok"}
 
-        with patch("plugin_manager.list_plugins", return_value=SAMPLE_PLUGINS):
+        after = [dict(SAMPLE_PLUGINS[0], version="new-version"), SAMPLE_PLUGINS[1], SAMPLE_PLUGINS[2]]
+        with patch("plugin_manager.list_plugins", side_effect=[SAMPLE_PLUGINS, after]):
             with patch("plugin_manager.update_one", side_effect=side_effect):
                 with patch("sys.stdout", new_callable=StringIO) as mock_out:
                     with self.assertRaises(SystemExit):
                         plugin_manager.cmd_update(self._make_args(all_=True))
                     output = mock_out.getvalue()
-        self.assertIn("1", output)   # updated count
-        self.assertIn("1", output)   # current count
-        self.assertIn("Failed", output)
+        self.assertIn("Updated: 1", output)
+        self.assertIn("Already current: 1", output)
+        self.assertIn("Failed: 1", output)
+
+    def test_updated_plugin_shows_restart_note(self):
+        after = [dict(SAMPLE_PLUGINS[0], version="new-version"), SAMPLE_PLUGINS[1], SAMPLE_PLUGINS[2]]
+        with patch("plugin_manager.list_plugins", side_effect=[SAMPLE_PLUGINS, after]):
+            with patch("plugin_manager.update_one", return_value={"id": "caveman@caveman", "code": 0, "message": "ok"}):
+                with patch("sys.stdout", new_callable=StringIO) as mock_out:
+                    plugin_manager.cmd_update(self._make_args(plugins=["caveman"]))
+                    output = mock_out.getvalue()
+        self.assertIn("restart Claude Code", output)
+
+    def test_vanished_plugin_reports_honest_message_not_success_text(self):
+        """code=0 but the plugin is absent from the post-update list must
+        not print its own success message next to a ✗ — that reads as a
+        contradiction."""
+        after = [SAMPLE_PLUGINS[1], SAMPLE_PLUGINS[2]]  # caveman missing
+        with patch("plugin_manager.list_plugins", side_effect=[SAMPLE_PLUGINS, after]):
+            with patch("plugin_manager.update_one", return_value={"id": "caveman@caveman", "code": 0, "message": "Plugin updated successfully"}):
+                with patch("sys.stdout", new_callable=StringIO) as mock_out:
+                    with self.assertRaises(SystemExit):
+                        plugin_manager.cmd_update(self._make_args(plugins=["caveman"]))
+                    output = mock_out.getvalue()
+        self.assertNotIn("Plugin updated successfully", output)
+        self.assertIn("no longer listed", output)
+
+    def test_no_restart_note_when_nothing_updated(self):
+        with patch("plugin_manager.list_plugins", side_effect=[SAMPLE_PLUGINS, SAMPLE_PLUGINS]):
+            with patch("plugin_manager.update_one", return_value={"id": "caveman@caveman", "code": 0, "message": "already current"}):
+                with patch("sys.stdout", new_callable=StringIO) as mock_out:
+                    plugin_manager.cmd_update(self._make_args(plugins=["caveman"]))
+                    output = mock_out.getvalue()
+        self.assertNotIn("restart Claude Code", output)
 
     def test_no_plugins_and_no_all_exits(self):
         """Calling update with no args should error."""
@@ -196,6 +260,41 @@ class TestCmdUpdate(unittest.TestCase):
             with patch("sys.stdout", new_callable=StringIO):
                 with self.assertRaises(SystemExit):
                     plugin_manager.cmd_update(self._make_args(plugins=[], all_=False))
+
+    def test_parallel_reports_updates_correctly(self):
+        """--all --parallel is the README's documented fast path — must be
+        covered directly, not just inferred from the sequential branch."""
+        after = [dict(SAMPLE_PLUGINS[0], version="new"), dict(SAMPLE_PLUGINS[1], version="new"), SAMPLE_PLUGINS[2]]
+        with patch("plugin_manager.list_plugins", side_effect=[SAMPLE_PLUGINS, after]):
+            with patch("plugin_manager.update_one", return_value={"id": "placeholder", "code": 0, "message": "ok"}) as mock_update:
+                def side_effect(plugin):
+                    return {"id": plugin["id"], "code": 0, "message": "ok"}
+                mock_update.side_effect = side_effect
+                with patch("sys.stdout", new_callable=StringIO) as mock_out:
+                    plugin_manager.cmd_update(self._make_args(all_=True, parallel=True))
+                    output = mock_out.getvalue()
+        self.assertEqual(mock_update.call_count, 3)
+        self.assertIn("Updated: 2", output)
+        self.assertIn("Already current: 1", output)
+
+    def test_parallel_exception_becomes_failed_row_not_crash(self):
+        """A raised exception inside a worker thread must surface as a
+        failed row in the summary, not an unhandled traceback."""
+        def side_effect(plugin):
+            if plugin["id"] == "ecc@ecc":
+                raise RuntimeError("subprocess exploded")
+            return {"id": plugin["id"], "code": 0, "message": "ok"}
+
+        after = [dict(SAMPLE_PLUGINS[0], version="new"), SAMPLE_PLUGINS[1], dict(SAMPLE_PLUGINS[2], version="new")]
+        with patch("plugin_manager.list_plugins", side_effect=[SAMPLE_PLUGINS, after]):
+            with patch("plugin_manager.update_one", side_effect=side_effect):
+                with patch("sys.stdout", new_callable=StringIO) as mock_out:
+                    with self.assertRaises(SystemExit) as ctx:
+                        plugin_manager.cmd_update(self._make_args(all_=True, parallel=True))
+                    output = mock_out.getvalue()
+        self.assertEqual(ctx.exception.code, 1)
+        self.assertIn("subprocess exploded", output)
+        self.assertIn("✗ ecc@ecc", output)
 
 
 class TestRunClaude(unittest.TestCase):
@@ -332,6 +431,70 @@ class TestCmdUninstall(unittest.TestCase):
         with patch("plugin_manager.list_plugins", return_value=SAMPLE_PLUGINS):
             with self.assertRaises(SystemExit):
                 plugin_manager.cmd_uninstall(self._make_args(plugins=[], yes=True))
+
+
+SAMPLE_MCP_LIST_OUTPUT = """\
+claude.ai Gmail: https://gmailmcp.googleapis.com/mcp/v1 - ✔ Connected
+plugin:code-graph-mcp:code-graph: node /home/user/.claude/plugins/cache/code-graph-mcp/scripts/mcp-launcher.js - ✔ Connected
+plugin:voicemode:voicemode: uv run voicemode - ✘ Failed to connect
+firecrawl: npx -y firecrawl-mcp - ✔ Connected
+"""
+
+
+class TestParseMcpList(unittest.TestCase):
+    def test_parses_all_lines(self):
+        records = plugin_manager.parse_mcp_list(SAMPLE_MCP_LIST_OUTPUT)
+        self.assertEqual(len(records), 4)
+
+    def test_splits_name_command_status(self):
+        records = plugin_manager.parse_mcp_list(SAMPLE_MCP_LIST_OUTPUT)
+        firecrawl = next(r for r in records if r["name"] == "firecrawl")
+        self.assertEqual(firecrawl["command"], "npx -y firecrawl-mcp")
+        self.assertEqual(firecrawl["status"], "✔ Connected")
+
+    def test_plugin_name_with_embedded_colons_kept_whole(self):
+        records = plugin_manager.parse_mcp_list(SAMPLE_MCP_LIST_OUTPUT)
+        names = [r["name"] for r in records]
+        self.assertIn("plugin:code-graph-mcp:code-graph", names)
+
+    def test_ignores_blank_and_malformed_lines(self):
+        records = plugin_manager.parse_mcp_list("\n   \nnot a valid line\n" + SAMPLE_MCP_LIST_OUTPUT)
+        self.assertEqual(len(records), 4)
+
+
+class TestClassifyMcpServer(unittest.TestCase):
+    def test_plugin_bundled(self):
+        self.assertEqual(plugin_manager.classify_mcp_server("plugin:code-graph-mcp:code-graph"), "plugin")
+
+    def test_host_connector(self):
+        self.assertEqual(plugin_manager.classify_mcp_server("claude.ai Gmail"), "host")
+
+    def test_standalone(self):
+        self.assertEqual(plugin_manager.classify_mcp_server("firecrawl"), "standalone")
+
+
+class TestCmdDoctor(unittest.TestCase):
+    def test_lists_only_standalone_servers(self):
+        with patch("plugin_manager.run_claude", return_value=(0, SAMPLE_MCP_LIST_OUTPUT, "")):
+            with patch("sys.stdout", new_callable=StringIO) as mock_out:
+                plugin_manager.cmd_doctor(None)
+                output = mock_out.getvalue()
+        self.assertIn("firecrawl", output)
+        self.assertNotIn("plugin:code-graph-mcp", output)
+        self.assertNotIn("claude.ai Gmail", output)
+
+    def test_reports_none_when_all_managed(self):
+        managed_only = "claude.ai Gmail: https://gmailmcp.googleapis.com/mcp/v1 - ✔ Connected\n"
+        with patch("plugin_manager.run_claude", return_value=(0, managed_only, "")):
+            with patch("sys.stdout", new_callable=StringIO) as mock_out:
+                plugin_manager.cmd_doctor(None)
+                output = mock_out.getvalue()
+        self.assertIn("none", output)
+
+    def test_exits_on_cli_error(self):
+        with patch("plugin_manager.run_claude", return_value=(1, "", "mcp list failed")):
+            with self.assertRaises(SystemExit):
+                plugin_manager.cmd_doctor(None)
 
 
 if __name__ == "__main__":
